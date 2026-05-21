@@ -1,3 +1,303 @@
+# Maintenance Window Routing 
+
+> This is a fork of [Hyperswitch](https://github.com/juspay/hyperswitch) with one custom routing feature added.
+> Design doc: [SPEC.md](./SPEC.md) | Architecture decisions: [DECISIONS.md](./DECISIONS.md)
+
+---
+
+## What was built
+
+A **TypeScript routing sidecar** (`routing-service/`) that sits in front of Hyperswitch and pre-emptively skips payment connectors during their declared UTC maintenance windows — picking the next available connector **before** any request is dispatched. Zero timeouts, zero failed attempts.
+
+```
+Your app  →  routing-service :3000 (TypeScript)  →  Hyperswitch :8080 (Rust)
+```
+
+**Example:** if Stripe has a maintenance window from `02:00–04:00 UTC`, and a payment comes in at `03:00 UTC`, the sidecar silently routes to Adyen instead. No timeout, no retry, no failed payment.
+
+---
+
+## Prerequisites
+
+You only need two things installed:
+
+| Tool | Install |
+|------|---------|
+| **Node.js** (v18 or newer) | https://nodejs.org |
+| **curl** | Already installed on most systems |
+
+> `jq` is optional but makes JSON output pretty. Install with `sudo apt install jq` (Linux) or `brew install jq` (Mac).
+
+Check your versions:
+```bash
+node --version   # should say v18.x or higher
+npm --version    # comes with Node
+```
+
+---
+
+## Project structure
+
+```
+hyperswitch-maintenance-window-router/
+│
+├── routing-service/               ← The custom routing feature (TypeScript)
+│   ├── src/
+│   │   ├── index.ts               ← HTTP server (Hono) — 3 endpoints
+│   │   ├── maintenanceWindow.ts   ← Core routing logic (pure functions)
+│   │   ├── traceStore.ts          ← In-memory store for routing traces
+│   │   └── __tests__/
+│   │       ├── maintenanceWindow.test.ts   ← Unit tests (9 tests)
+│   │       └── app.test.ts                 ← HTTP integration tests (7 tests)
+│   ├── config/
+│   │   └── windows.json           ← Edit this to configure maintenance windows
+│   ├── package.json
+│   └── tsconfig.json
+│
+├── scripts/
+│   └── demo.sh                    ← One-command end-to-end demo
+│
+├── Makefile                       ← Shortcuts: make demo / make test-routing / make dev
+├── SPEC.md                        ← Design doc written before any code
+├── DECISIONS.md                   ← Architecture decisions and trade-offs
+│
+└── crates/                        ← Hyperswitch Rust source (unchanged)
+```
+
+---
+
+## Quickstart — run the demo in 3 steps
+
+```bash
+# Step 1: clone the repo
+git clone <this-repo-url>
+cd hyperswitch
+
+# Step 2: install dependencies for the routing service
+cd routing-service && npm install && cd ..
+
+# Step 3: run the demo
+make demo
+```
+
+That's it. The demo will:
+1. Set a maintenance window for **Stripe** that covers the current UTC time
+2. Start the routing service on port 3000
+3. Send a test payment
+4. Print the routing decision (you should see Stripe skipped, Adyen chosen)
+5. Show the full routing trace from the bonus API
+
+**Expected output:**
+```
+═══════════════════════════════════════════════════
+ Maintenance-Window Routing Demo (TypeScript)
+═══════════════════════════════════════════════════
+ Stripe window (UTC): 18:26 – 18:38
+ Current UTC time:    18:27 (1107 mins)
+
+▶ Starting routing-service...
+✓ routing-service healthy
+
+▶ Sending payment...
+  chosen connector : adyen
+  skipped          : stripe
+
+ routing_decision log lines:
+═══════════════════════════════════════════════════
+{"routing_decision":"connector_skipped","connector":"stripe","reason":"maintenance_window","nowUtcMins":1107}
+{"routing_decision":"connector_chosen","connector":"adyen","skippedCount":1,"nowUtcMins":1107}
+
+ GET /routing-trace/demo_pay_001:
+═══════════════════════════════════════════════════
+{
+  "chosenConnector": "adyen",
+  "skipped": [{ "connector": "stripe", "reason": "maintenance_window" }],
+  "nowUtcMins": 1107,
+  "allInMaintenance": false
+}
+
+ Demo complete.
+ Expected: stripe SKIPPED (in maintenance), adyen CHOSEN.
+```
+
+> **Note:** The payment will show `error: upstream Hyperswitch unreachable` — that's expected. The routing decision fires *before* forwarding to Hyperswitch. The log lines and trace API are the proof the logic works.
+
+---
+
+## Run tests
+
+```bash
+make test-routing
+```
+
+Or manually:
+```bash
+cd routing-service
+npm test
+```
+
+**Expected output — all 16 tests should pass:**
+```
+PASS src/__tests__/maintenanceWindow.test.ts
+  ✓ parses valid times
+  ✓ returns null on malformed input (safe default → window inactive)
+  ✓ returns false for malformed bounds (safe default)
+  ✓ skips stripe (in maintenance 02:00–04:00) and chooses adyen at 02:30 UTC
+  ✓ skips stripe at 23:30 (inside 23:00–01:00)
+  ✓ skips stripe at 00:30 (post-midnight, still inside 23:00–01:00)
+  ✓ does NOT skip stripe at 01:00 (exclusive end boundary)
+  ✓ does NOT skip stripe at 22:59 (before window starts)
+  ✓ returns chosen=null and allInMaintenance=true when all connectors are down
+
+PASS src/__tests__/app.test.ts
+  ✓ GET /health returns 200 with status ok
+  ✓ chooses primary connector when it has no maintenance window
+  ✓ skips stripe in maintenance and chooses adyen
+  ✓ returns 503 when all connectors are in maintenance
+  ✓ returns 502 with routing_decision when Hyperswitch is unreachable
+  ✓ returns the decision stored during a payment request
+  ✓ returns 404 for unknown payment ids
+
+Tests: 16 passed, 16 total
+```
+
+---
+
+## Run the service interactively (for manual testing)
+
+```bash
+make dev
+```
+
+The service starts on **http://localhost:3000**.
+
+Now open a second terminal and try the endpoints:
+
+### Health check
+```bash
+curl http://localhost:3000/health
+```
+```json
+{ "status": "ok", "service": "maintenance-window-router" }
+```
+
+### Send a payment
+```bash
+curl -X POST http://localhost:3000/payments \
+  -H "api-key: test_key" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "amount": 1000,
+    "currency": "USD",
+    "payment_id": "my_test_payment"
+  }'
+```
+
+### Check the routing trace (bonus API)
+```bash
+curl http://localhost:3000/routing-trace/my_test_payment
+```
+```json
+{
+  "chosenConnector": "stripe",
+  "skipped": [],
+  "nowUtcMins": 720,
+  "allInMaintenance": false,
+  "paymentId": "my_test_payment",
+  "timestamp": "2026-05-21T12:00:00.000Z"
+}
+```
+
+---
+
+## Configure maintenance windows
+
+Edit **`routing-service/config/windows.json`**:
+
+```json
+{
+  "routingOrder": ["stripe", "adyen"],
+  "maintenanceWindows": {
+    "stripe": [{ "start": "02:00", "end": "04:00" }],
+    "adyen":  []
+  }
+}
+```
+
+| Field | What it does |
+|-------|-------------|
+| `routingOrder` | Connectors in priority order. First available one is chosen. |
+| `maintenanceWindows` | Per-connector list of UTC time ranges to skip. Empty array = always available. |
+| `start` / `end` | 24-hour UTC time in `"HH:MM"` format. |
+
+**Midnight-crossing windows work too:**
+```json
+"stripe": [{ "start": "23:00", "end": "01:00" }]
+```
+This skips Stripe from 11 PM to 1 AM UTC.
+
+**Multiple windows per connector:**
+```json
+"stripe": [
+  { "start": "02:00", "end": "04:00" },
+  { "start": "14:00", "end": "14:30" }
+]
+```
+
+The file is re-read on every request — no restart needed after changes.
+
+---
+
+## All available commands
+
+| Command | What it does |
+|---------|-------------|
+| `make demo` | Full end-to-end demo — sets a window, starts service, sends payment, shows logs |
+| `make test-routing` | Runs all 16 Jest tests |
+| `make dev` | Starts the routing service on port 3000 for manual testing |
+
+---
+
+## How it works (for the curious)
+
+1. A payment `POST /payments` hits the routing service
+2. It reads `config/windows.json` to get the connector priority list and windows
+3. It checks the current UTC time against each connector's windows
+4. Connectors in an active window are removed from the list
+5. The first remaining connector is chosen
+6. The payment is forwarded to Hyperswitch with `routing: { type: "single", data: { connector: "adyen" } }` — this forces Hyperswitch to use exactly that connector
+7. The routing decision is saved in memory and available via `GET /routing-trace/:paymentId`
+
+**Log format (one line per decision):**
+```json
+{"routing_decision":"connector_skipped","connector":"stripe","reason":"maintenance_window","nowUtcMins":150}
+{"routing_decision":"connector_chosen","connector":"adyen","skippedCount":1,"nowUtcMins":150}
+```
+
+**If every connector is in maintenance:** the service returns HTTP 503 immediately — no request is forwarded to Hyperswitch.
+
+---
+
+## Source files explained
+
+| File | Lines | Purpose |
+|------|-------|---------|
+| `routing-service/src/maintenanceWindow.ts` | 111 | Pure logic: parse times, check windows, decide connector. No side effects. |
+| `routing-service/src/index.ts` | 162 | Hono HTTP server. Three routes: `/health`, `POST /payments`, `GET /routing-trace/:id` |
+| `routing-service/src/traceStore.ts` | ~30 | In-memory map of `paymentId → decision`. Capped at 1,000 entries. |
+| `routing-service/src/__tests__/maintenanceWindow.test.ts` | 137 | 9 unit tests for the core logic |
+| `routing-service/src/__tests__/app.test.ts` | 170 | 7 HTTP integration tests using Hono's built-in test client |
+| `routing-service/config/windows.json` | 1 | Config file — edit this to define windows |
+| `scripts/demo.sh` | 90 | Automated demo script |
+| `SPEC.md` | ~75 | Written before any code — defines the problem, inputs, outputs, test matrix |
+| `DECISIONS.md` | ~60 | Why TypeScript, why a proxy, what was skipped, production concerns |
+
+---
+
+*The rest of this file is the original Hyperswitch README.*
+
+---
+
 <p align="center">
   <img src="./docs/imgs/hyperswitch-logo-dark.svg#gh-dark-mode-only" alt="Hyperswitch-Logo" width="40%" />
   <img src="./docs/imgs/hyperswitch-logo-light.svg#gh-light-mode-only" alt="Hyperswitch-Logo" width="40%" />
