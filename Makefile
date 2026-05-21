@@ -31,11 +31,36 @@ ROOT_DIR := $(realpath $(ROOT_DIR_WITH_SLASH))
 	start \
 	stop \
 	rm \
-	release
+	release \
+	demo \
+	test-routing \
+	dev
 
+
+# ── Custom routing targets ────────────────────────────────────────────────────
+
+# Full end-to-end demo: patches config, starts stack, sends test payment,
+# tails routing_decision log lines.
+#
+# Usage: make demo
+demo:
+	./scripts/demo.sh
+
+# Run the routing-service unit tests (TypeScript/Jest).
+# Requires Node.js installed locally, OR run inside the container.
+#
+# Usage: make test-routing
+test-routing:
+	cd routing-service && npm install && npm test
+
+# Start the routing-service locally.
+#
+# Usage: make dev
+dev:
+	cd routing-service && npm install && npm run dev
 
 # Check a local package and all of its dependencies for errors
-# 
+#
 # Usage :
 #	make check
 check:
