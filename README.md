@@ -71,7 +71,7 @@ hyperswitch-maintenance-window-router/
 ```bash
 # Step 1: clone the repo
 git clone <this-repo-url>
-cd hyperswitch
+cd hyperswitch-maintenance-window-router
 
 # Step 2: install dependencies for the routing service
 cd routing-service && npm install && cd ..
